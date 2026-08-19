@@ -8,6 +8,7 @@ import (
 	"debug/elf"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -243,6 +244,10 @@ func (k *Kmod) readKernelAliases() error {
 	}
 	defer f.Close()
 
+	if stat, err := f.Stat(); err == nil && stat.Size() > 0 {
+		k.aliases = make([]alias, 0, stat.Size()/60)
+	}
+
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		line := s.Text()
@@ -278,14 +283,14 @@ func readBuiltinModinfo(dir string, propName string) (map[string][]string, error
 	}
 
 	result := make(map[string][]string)
-
-	re := regexp.MustCompile(`(\w*?).` + propName + `=([^\0]*)`)
-	matches := re.FindAllSubmatch(data, -1)
-
-	for _, m := range matches {
-		name := string(m[1])
-		fw := string(m[2])
-		result[name] = append(result[name], fw)
+	prefix := []byte("." + propName + "=")
+	for item := range bytes.SplitSeq(data, []byte{0}) {
+		idx := bytes.Index(item, prefix)
+		if idx != -1 {
+			name := string(item[:idx])
+			val := string(item[idx+len(prefix):])
+			result[name] = append(result[name], val)
+		}
 	}
 
 	return result, nil
@@ -409,19 +414,19 @@ func (k *Kmod) addModulesToImage(img *Image) error {
 
 func (k *Kmod) scanModulesDir() error {
 	// go through modulesDir and extract all module names to build a map name <-> path
-	return filepath.Walk(k.hostModulesDir, func(filename string, info os.FileInfo, err error) error {
+	return filepath.WalkDir(k.hostModulesDir, func(filename string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			if info.Name() == "build" && filename == filepath.Join(k.hostModulesDir, "build") {
+		if d.IsDir() {
+			if d.Name() == "build" && filename == filepath.Join(k.hostModulesDir, "build") {
 				// skip header files under ./build dir
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		parts := strings.Split(info.Name(), ".")
+		parts := strings.Split(d.Name(), ".")
 		// kernel module either has ext of *.ko or *.ko.$COMPRESSION
 		if len(parts) < 2 || len(parts) > 3 || parts[1] != "ko" {
 			// it is not a kernel module
@@ -712,14 +717,14 @@ func (k *Kmod) filterAliasesForRequiredModules(conf *generatorConfig) ([]alias, 
 func readDeviceAliases() (set, error) {
 	aliases := make(set)
 
-	err := filepath.Walk("/sys/devices", func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir("/sys/devices", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
-		if info.Name() != "modalias" {
+		if d.Name() != "modalias" {
 			return nil
 		}
 

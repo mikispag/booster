@@ -32,4 +32,22 @@ func TestFileType(t *testing.T) {
 	check("xz", "xz")
 	check("lz4", "lz4")
 	check("none", "cpio")
+
+	// Test empty file
+	emptyFile, err := os.CreateTemp(dir, "empty")
+	require.NoError(t, err)
+	defer emptyFile.Close()
+	kind, err := filetype(emptyFile)
+	require.NoError(t, err)
+	require.Equal(t, "", kind)
+
+	// Test unknown small file
+	unknownFile, err := os.CreateTemp(dir, "unknown")
+	require.NoError(t, err)
+	defer unknownFile.Close()
+	_, err = unknownFile.Write([]byte("random"))
+	require.NoError(t, err)
+	kind, err = filetype(unknownFile)
+	require.NoError(t, err)
+	require.Equal(t, "", kind)
 }

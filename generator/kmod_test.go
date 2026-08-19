@@ -161,13 +161,21 @@ func TestReadDeviceAliases(t *testing.T) {
 func TestReadBuiltinModinfo(t *testing.T) {
 	t.Parallel()
 
-	ver, err := readKernelVersion()
-	require.NoError(t, err)
+	dir := t.TempDir()
+	content := "ext4.alias=fs-ext4\x00e1000e.firmware=e1000e/e1000e.bin\x00e1000e.firmware=e1000e/e1000e2.bin\x00other.prop=val\x00"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "modules.builtin.modinfo"), []byte(content), 0o644))
 
-	fws, err := readBuiltinModinfo("/usr/lib/modules/"+ver, "file")
+	res, err := readBuiltinModinfo(dir, "firmware")
 	require.NoError(t, err)
+	require.Equal(t, map[string][]string{
+		"e1000e": {"e1000e/e1000e.bin", "e1000e/e1000e2.bin"},
+	}, res)
 
-	_ = fws
+	resAlias, err := readBuiltinModinfo(dir, "alias")
+	require.NoError(t, err)
+	require.Equal(t, map[string][]string{
+		"ext4": {"fs-ext4"},
+	}, resAlias)
 }
 
 func TestParseModprobe(t *testing.T) {

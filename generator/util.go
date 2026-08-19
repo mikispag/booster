@@ -75,7 +75,7 @@ func unwrapExitError(err error) error {
 // stripQuotes removes leading and trailing quote symbols if they wrap the given sentence
 func stripQuotes(in string) string {
 	l := len(in)
-	if in[0] == '"' && in[l-1] == '"' {
+	if l >= 2 && ((in[0] == '"' && in[l-1] == '"') || (in[0] == '\'' && in[l-1] == '\'')) {
 		return in[1 : l-1]
 	}
 

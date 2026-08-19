@@ -772,9 +772,6 @@ func deleteContent(path string, rootDev uint64) error {
 		}
 
 		for _, e := range dirEntries {
-			if e.Name() == "." || e.Name() == ".." {
-				continue
-			}
 			if err := deleteContent(filepath.Join(path, e.Name()), rootDev); err != nil {
 				return err
 			}
@@ -958,10 +955,10 @@ func scanSysBlock() error {
 }
 
 func scanSysModaliases() error {
-	return filepath.Walk("/sys/devices", walkSysModaliases)
+	return filepath.WalkDir("/sys/devices", walkSysModaliases)
 }
 
-func walkSysModaliases(path string, fi os.FileInfo, err error) error {
+func walkSysModaliases(path string, d fs.DirEntry, err error) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// /dev/sys has a number of ephemeral files (like 'waiting_for_supplier') that might be added/removed
@@ -970,10 +967,10 @@ func walkSysModaliases(path string, fi os.FileInfo, err error) error {
 		}
 		return err
 	}
-	if fi.IsDir() {
+	if d.IsDir() {
 		return nil
 	}
-	if fi.Name() != "modalias" {
+	if d.Name() != "modalias" {
 		return nil
 	}
 
