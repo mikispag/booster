@@ -126,8 +126,11 @@ type promptRegistration struct {
 	d           luks.Device
 	checkSlots  []int
 	mappingName string
+	// unlock is an optional custom unlock function for non-LUKS backends (e.g. ZFS).
+	// If nil, tryPassphraseAgainstSlots is used with volumes, d, and checkSlots.
+	unlock func(ctx context.Context, password []byte) bool
 	// inflight counts goroutines that submitted via trySubmitPassphraseToPending
-	// (today: SSH remote unlock) and may still be mid-UnsealVolume after
+	// (today: SSH remote unlock) and may still be mid-UnsealVolume / unlock after
 	// senderWg.Wait() returns. luksOpen's watcher waits on this before
 	// close(volumes) so the goroutine can't send on a closed channel and
 	// panic pid 1.
@@ -164,7 +167,7 @@ func trySubmitPassphraseToPending(password []byte) []string {
 	pendingPrompts.Lock()
 	snapshot := make([]*promptRegistration, 0, len(pendingPrompts.entries))
 	for p := range pendingPrompts.entries {
-		if p.ctx.Err() != nil {
+		if p.ctx != nil && p.ctx.Err() != nil {
 			continue
 		}
 		// Bump inflight under the same lock that owns entries — luksOpen's
@@ -184,13 +187,25 @@ func trySubmitPassphraseToPending(password []byte) []string {
 	for _, p := range snapshot {
 		wg.Go(func() {
 			defer p.inflight.Done()
-			if tryPassphraseAgainstSlots(p.ctx, p.volumes, p.d, p.checkSlots, password) {
+			var ok bool
+			if p.unlock != nil {
+				ctx := p.ctx
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				ok = p.unlock(ctx, password)
+			} else {
+				ok = tryPassphraseAgainstSlots(p.ctx, p.volumes, p.d, p.checkSlots, password)
+			}
+			if ok {
 				// Dismiss this device's unlock orchestration now that the
-				// volume is in hand — mirrors the token-success cancel.
+				// volume/key is in hand — mirrors the token-success cancel.
 				// pendingDeviceNames filters by ctx.Err(), so the next
 				// sshPromptLoop iteration won't re-list this device while
 				// luksOpen is still finishing SetupMapper.
-				p.cancel()
+				if p.cancel != nil {
+					p.cancel()
+				}
 				mu.Lock()
 				unlocked = append(unlocked, p.mappingName)
 				mu.Unlock()
@@ -215,7 +230,7 @@ func pendingDeviceNames() []string {
 	pendingPrompts.Lock()
 	names := make([]string, 0, len(pendingPrompts.entries))
 	for p := range pendingPrompts.entries {
-		if p.ctx.Err() != nil {
+		if p.ctx != nil && p.ctx.Err() != nil {
 			continue
 		}
 		names = append(names, p.mappingName)

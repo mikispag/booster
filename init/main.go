@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -1165,41 +1166,66 @@ func mountZfsRoot() error {
 
 	debug("importing zfs pool %s", pool)
 
-	err := exec.Command("zpool", "import", "-c", "/etc/zfs/zpool.cache", "-N", pool).Run()
-	if err != nil {
-		return unwrapExitError(err)
+	var importErr error
+	var deadline time.Time
+	if config.MountTimeout > 0 {
+		deadline = time.Now().Add(time.Duration(config.MountTimeout) * time.Second)
+	}
+	for {
+		cmd := exec.Command("zpool", "import", "-c", "/etc/zfs/zpool.cache", "-N", pool)
+		if err := cmd.Run(); err == nil {
+			break
+		}
+		cmdNoCache := exec.Command("zpool", "import", "-N", pool)
+		var stderrNoCache bytes.Buffer
+		cmdNoCache.Stderr = &stderrNoCache
+		if errNoCache := cmdNoCache.Run(); errNoCache == nil {
+			break
+		} else {
+			importErr = fmt.Errorf("zpool import %s: %w: %s", pool, errNoCache, strings.TrimSpace(stderrNoCache.String()))
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return importErr
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	// find all child datasets and mount them
 	// zfs list -H -o name -t filesystem -r $zfsDataset
-	var datasets []byte
-	datasets, err = exec.Command("zfs", "list", "-H", "-o", "name", "-t", "filesystem", "-r", zfsDataset).Output()
+	cmdList := exec.Command("zfs", "list", "-H", "-o", "name", "-t", "filesystem", "-r", zfsDataset)
+	var stderrList bytes.Buffer
+	cmdList.Stderr = &stderrList
+	datasets, err := cmdList.Output()
 	if err != nil {
-		return unwrapExitError(err)
+		return fmt.Errorf("zfs list %s: %w: %s", zfsDataset, err, strings.TrimSpace(stderrList.String()))
 	}
 
 	flags, options := mountFlags()
 	options = strings.Join([]string{"zfsutil", options}, ",")
 	for ds := range strings.SplitSeq(strings.TrimSpace(string(datasets)), "\n") {
+		ds = strings.TrimSpace(ds)
+		if ds == "" {
+			continue
+		}
 		encryptionRoot, err := getZfsPropertyValue("encryptionroot", ds)
 		if err != nil {
-			return unwrapExitError(err)
+			return err
 		}
 		if encryptionRoot != "-" {
 			keyStatus, err := getZfsPropertyValue("keystatus", encryptionRoot)
 			if err != nil {
-				return unwrapExitError(err)
+				return err
 			}
 			if keyStatus == "unavailable" {
 				err := loadZfsKey(encryptionRoot)
 				if err != nil {
-					return unwrapExitError(err)
+					return err
 				}
 			}
 		}
 		mt, err := getZfsPropertyValue("mountpoint", ds)
 		if err != nil {
-			return unwrapExitError(err)
+			return err
 		}
 		switch mt {
 		case "none":
@@ -1218,29 +1244,178 @@ func mountZfsRoot() error {
 	return nil
 }
 
-func getZfsPropertyValue(property, dataset string) (string, error) {
-	val, err := exec.Command("zfs", "get", "-H", "-o", "value", property, dataset).Output()
+// getZfsPropertyValue returns the value of the given property for the dataset.
+// Indirected through a var so tests can mock it.
+var getZfsPropertyValue = func(property, dataset string) (string, error) {
+	cmd := exec.Command("zfs", "get", "-H", "-o", "value", property, dataset)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	val, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("zfs get %s %s: %w: %s", property, dataset, err, strings.TrimSpace(stderr.String()))
 	}
 	return strings.TrimSpace(string(val)), nil
 }
 
+// execZfsLoadKey runs `zfs load-key <encryptionRoot>` feeding password via stdin if provided.
+// Returns (true, nil) on success, (false, nil) on incorrect passphrase (*exec.ExitError),
+// or (false, err) on systemic execution errors.
+// Indirected through a var so tests can mock it.
+var execZfsLoadKey = func(ctx context.Context, encryptionRoot string, password []byte) (bool, error) {
+	cmd := exec.CommandContext(ctx, "zfs", "load-key", encryptionRoot)
+	if len(password) > 0 {
+		input := make([]byte, len(password)+1)
+		copy(input, password)
+		input[len(password)] = '\n'
+		defer wipe(input)
+		cmd.Stdin = bytes.NewReader(input)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		if _, ok := err.(*exec.ExitError); ok {
+			debug("zfs load-key for %s failed: %v: %s", encryptionRoot, err, strings.TrimSpace(stderr.String()))
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func tryCachedZfsPassphrase(ctx context.Context, encryptionRoot string) bool {
+	passphraseCache.Lock()
+	cached := make([][]byte, len(passphraseCache.passwords))
+	copy(cached, passphraseCache.passwords)
+	passphraseCache.Unlock()
+
+	for _, pw := range cached {
+		if ok, _ := execZfsLoadKey(ctx, encryptionRoot, pw); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func loadZfsKey(encryptionRoot string) error {
-	for {
-		zfsLoadKey := exec.Command("zfs", "load-key", encryptionRoot)
-		zfsLoadKey.Stdin = os.Stdin
-		zfsLoadKey.Stdout = os.Stdout
-		zfsLoadKey.Stderr = os.Stderr
-		err := zfsLoadKey.Run()
-		if err != nil {
-			warning("running `zfs load-key`: %v", err)
-			if _, ok := err.(*exec.ExitError); ok {
-				continue
+	location, err := getZfsPropertyValue("keylocation", encryptionRoot)
+	if err != nil {
+		return err
+	}
+
+	if location != "prompt" {
+		if strings.HasPrefix(location, "file://") {
+			path := strings.TrimPrefix(location, "file://")
+			timeout := defaultKeyfileDeviceTimeout
+			if config.MountTimeout > 0 {
+				timeout = time.Duration(config.MountTimeout) * time.Second
 			}
+			for deadline := time.Now().Add(timeout); ; {
+				if _, err := os.Stat(path); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					warning("zfs: key file %s has not appeared, trying anyway", path)
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+
+		ok, err := execZfsLoadKey(context.Background(), encryptionRoot, nil)
+		if err != nil {
 			return err
 		}
+		if !ok {
+			return fmt.Errorf("loading key for %s from %s failed", encryptionRoot, location)
+		}
 		return nil
+	}
+
+	// Fast path: try cached passwords from previously unlocked volumes/datasets
+	if tryCachedZfsPassphrase(context.Background(), encryptionRoot) {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := &promptRegistration{
+		ctx:         ctx,
+		cancel:      cancel,
+		mappingName: encryptionRoot,
+		unlock: func(uCtx context.Context, password []byte) bool {
+			ok, _ := execZfsLoadKey(uCtx, encryptionRoot, password)
+			return ok
+		},
+	}
+	registerPendingPrompt(reg)
+	defer unregisterPendingPrompt(reg)
+
+	if err := waitForPlymouthInit(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	keyboardMu.Lock()
+	defer keyboardMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	if tryCachedZfsPassphrase(ctx, encryptionRoot) {
+		return nil
+	}
+
+	promptPrefix := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		prompt := promptPrefix + fmt.Sprintf("Enter passphrase for '%s':", encryptionRoot)
+		password, err := askKeyboardPassword(ctx, prompt, "   Unlocking ZFS...")
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil // unlocked by SSH remote unlock
+			}
+			warning("reading password: %v", err)
+			return err
+		}
+
+		ok, err := execZfsLoadKey(ctx, encryptionRoot, password)
+		if err != nil {
+			wipe(password)
+			warning("running `zfs load-key`: %v", err)
+			return err
+		}
+		if ok {
+			passphraseCache.Lock()
+			passphraseCache.passwords = append(passphraseCache.passwords, password)
+			passphraseCache.Unlock()
+			statusMessage("")
+			return nil
+		}
+
+		wipe(password)
+		promptPrefix = "Incorrect passphrase — "
+		if !plymouthEnabled {
+			console("   Incorrect passphrase, please try again\n")
+		}
 	}
 }
 
