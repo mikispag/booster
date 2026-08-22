@@ -172,11 +172,8 @@ func getNextParam(params string, index int) (string, string, int) {
 }
 
 func parseParams(params string) error {
-	var luksOptions []string
-	var tokenTimeout time.Duration
-	var tokenTimeoutExplicit bool
-	measurePCR := measurePCRAuto
-	var tpm2Signature string
+	globalOptions := newLuksOptions()
+	globalKeyfile := ""
 
 	var key, value string
 	i := 0
@@ -246,39 +243,35 @@ func parseParams(params string) error {
 			b := false
 			rootReadOnly = &b
 		case "rd.luks.options":
-			for o := range strings.SplitSeq(value, ",") {
-				if after, ok := strings.CutPrefix(o, "token-timeout="); ok {
-					d, err := parseTokenTimeout(after)
+			// A leading token that parses as a UUID selects systemd's per-device
+			// form. An option value may itself contain '=', so cut only the first.
+			if head, rest, found := strings.Cut(value, "="); found {
+				if uuid, err := parseUUID(head); err == nil {
+					m := findOrCreateLuksMapping(uuid)
+					if m.cmdlineOptions == nil {
+						opts := newLuksOptions()
+						m.cmdlineOptions = &opts
+					}
+					skip, err := parseLuksOptions(m.cmdlineOptions, rest, "rd.luks.options: "+head)
 					if err != nil {
-						return fmt.Errorf("invalid token-timeout in rd.luks.options: %v", err)
+						return err
 					}
-					tokenTimeout = d
-					tokenTimeoutExplicit = true
-					continue
-				}
-				if after, ok := strings.CutPrefix(o, "tpm2-measure-pcr="); ok {
-					s, valid := parseMeasurePCR(after)
-					if !valid {
-						return fmt.Errorf("invalid tpm2-measure-pcr in rd.luks.options: %q", after)
+					if skip != "" {
+						// The rest of the list still applies: only the option that
+						// would have discarded a crypttab entry is meaningless here.
+						warning("rd.luks.options: %s: %q selects a volume type or opts out of unlocking, which the kernel command line cannot do; ignoring it", head, skip)
 					}
-					measurePCR = s
 					continue
 				}
-				if after, ok := strings.CutPrefix(o, "tpm2-signature="); ok {
-					tpm2Signature = after
-					continue
-				}
-				// Accept fido2-device= and tpm2-device= for compatibility with
-				// systemd-cryptsetup conventions. Booster auto-detects enrolled
-				// tokens from the LUKS header so no action is needed.
-				if strings.HasPrefix(o, "fido2-device=") || strings.HasPrefix(o, "tpm2-device=") {
-					continue
-				}
-				flag, ok := rdLuksOptions[o]
-				if !ok {
-					return fmt.Errorf("unknown value in rd.luks.options: %v", o)
-				}
-				luksOptions = append(luksOptions, flag)
+			}
+			// A list with no UUID goes through the same parser, into an
+			// option set held until every source is known.
+			skip, err := parseLuksOptions(&globalOptions, value, "rd.luks.options")
+			if err != nil {
+				return err
+			}
+			if skip != "" {
+				warning("rd.luks.options: %q selects a volume type or opts out of unlocking, which the kernel command line cannot do; ignoring it", skip)
 			}
 		case "rd.luks.name":
 			parts := strings.Split(value, "=")
@@ -307,16 +300,12 @@ func parseParams(params string) error {
 			parts := strings.SplitN(value, "=", 2)
 
 			if len(parts) == 1 {
-				// do we only have 1 luks device?
-				if len(luksMappings) == 1 {
-					// we attach to it and hope for the best
-					uuid = luksMappings[0].ref.data.(UUID)
-				} else {
-					// don't know what to do here
-					return fmt.Errorf("invalid rd.luks.key kernel parameter %s, more than 1 luks device", value)
-				}
-
-				keyfile = parts[0]
+				// No UUID: a default for every device the command line does not
+				// give a key file of its own. Held until resolveLuksOptions,
+				// because which devices exist is not known until crypttab has
+				// been read as well.
+				globalKeyfile = parts[0]
+				continue
 			} else if len(parts) == 2 {
 				var err error
 				uuid, err = parseUUID(parts[0])
@@ -352,9 +341,14 @@ func parseParams(params string) error {
 			if err != nil {
 				return fmt.Errorf("rd.luks.header: %v", err)
 			}
+			// Deprecated: this parameter exists only because the command line
+			// had no per-device option form when it was added. It now does, and
+			// systemd spells the same thing through it.
+			warning("rd.luks.header= is deprecated, use rd.luks.options=%s=header=%s instead", value[:eqIdx], headerPath)
 			m := findOrCreateLuksMapping(uuid)
-			m.header = path
-			m.headerDeviceRef = ref
+			hdr := newLuksOptions()
+			hdr.header, hdr.headerDeviceRef = path, ref
+			m.deprecatedHeader = &hdr
 		case "rd.luks.data":
 			eqIdx := strings.Index(value, "=")
 			if eqIdx < 0 {
@@ -382,21 +376,15 @@ func parseParams(params string) error {
 		}
 	}
 
-	for i := range luksMappings {
-		if luksOptions != nil {
-			luksMappings[i].options = luksOptions
-		}
-		if tokenTimeoutExplicit {
-			luksMappings[i].tokenTimeout = tokenTimeout
-			luksMappings[i].tokenTimeoutExplicit = true
-		}
-		if measurePCR != measurePCRAuto {
-			luksMappings[i].measurePCR = measurePCR
-		}
-		if tpm2Signature != "" {
-			luksMappings[i].tpm2Signature = tpm2Signature
-		}
+	// Hold the UUID-less list rather than applying it here: crypttab has not
+	// been read yet, so this is not the place that can decide what a device
+	// ends up with. resolveLuksOptions composes it.
+	if globalOptions.header != "" {
+		warning("rd.luks.options: header= describes a single volume, so it is only accepted as rd.luks.options=$UUID=header=..., ignoring")
+		globalOptions.header, globalOptions.headerDeviceRef = "", nil
 	}
+	globalLuksOptions = globalOptions
+	globalLuksKeyfile = globalKeyfile
 
 	return nil
 }
@@ -422,5 +410,13 @@ func parseTokenTimeout(s string) (time.Duration, error) {
 		}
 		return time.Duration(secs) * time.Second, nil
 	}
-	return time.ParseDuration(s)
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		// a negative duration would collide with luksOptionUnset
+		return 0, fmt.Errorf("negative timeout %q", s)
+	}
+	return d, nil
 }

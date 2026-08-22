@@ -1,17 +1,39 @@
 package main
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/anatol/luks.go"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
-func TestParseParamsInvalidLuksOptions(t *testing.T) {
-	luksMappings = nil
+// parseParamsResolved parses and then composes, which is what boot does: the
+// command line no longer decides on its own what a device ends up with.
+func parseParamsResolved(params string) error {
+	if err := parseParams(params); err != nil {
+		return err
+	}
+	resolveLuksOptions(nil)
+	return nil
+}
 
-	require.Error(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root rd.luks.name=7843d77f-cdd6-4289-a4de-a708c4aacede=swap rd.luks.name=7f28c723-fd6b-4640-bc94-9366edd8880d=cache root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f video=efifb:on add_efi_memmap zswap.enabled=1 zswap.max_pool_percent=100 zswap.zpool=z3fold resume=/dev/mapper/swap acpi=copy_dsdt rd.luks.options=bogus-option"))
+func TestParseParamsUnknownLuksOptionIsNotFatal(t *testing.T) {
+	// An unrecognised option used to abort parsing and drop the machine to the
+	// emergency shell. It is reported and skipped instead.
+	luksMappings = nil
+	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=bogus-option"))
+	require.Len(t, luksMappings, 1)
+}
+
+func TestParseParamsInvalidLuksOptionValueStaysFatal(t *testing.T) {
+	// A malformed value for a recognised option is unambiguous, so it still fails.
+	luksMappings = nil
+	require.Error(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=notaduration"))
 }
 
 func TestParseParamsLuksData(t *testing.T) {
@@ -41,7 +63,7 @@ func TestParseParamsLuksData(t *testing.T) {
 func TestParseParams(t *testing.T) {
 	luksMappings = nil
 
-	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root rd.luks.name=7843d77f-cdd6-4289-a4de-a708c4aacede=swap rd.luks.name=7f28c723-fd6b-4640-bc94-9366edd8880d=cache root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f video=efifb:on add_efi_memmap rd.luks.options=no-read-workqueue zswap.enabled=1 zswap.max_pool_percent=100 zswap.zpool=z3fold resume=/dev/mapper/swap acpi=copy_dsdt"))
+	require.NoError(t, parseParamsResolved("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root rd.luks.name=7843d77f-cdd6-4289-a4de-a708c4aacede=swap rd.luks.name=7f28c723-fd6b-4640-bc94-9366edd8880d=cache root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f video=efifb:on add_efi_memmap rd.luks.options=no-read-workqueue zswap.enabled=1 zswap.max_pool_percent=100 zswap.zpool=z3fold resume=/dev/mapper/swap acpi=copy_dsdt"))
 	require.Equal(t, "/dev/mapper/swap", cmdResume.data)
 	require.Equal(t, refPath, cmdResume.format)
 	require.Equal(t, "e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f", cmdRoot.data.(UUID).toString())
@@ -71,38 +93,38 @@ func TestParseParamsMeasurePCR(t *testing.T) {
 	const base = "rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f"
 
 	luksMappings = nil
-	require.NoError(t, parseParams(base+" rd.luks.options=tpm2-measure-pcr=yes"))
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tpm2-measure-pcr=yes"))
 	require.Len(t, luksMappings, 1)
 	require.Equal(t, measurePCRForce, luksMappings[0].measurePCR)
 
 	luksMappings = nil
-	require.NoError(t, parseParams(base+" rd.luks.options=tpm2-measure-pcr=no"))
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tpm2-measure-pcr=no"))
 	require.Equal(t, measurePCRDisabled, luksMappings[0].measurePCR)
 
 	// Unset on the cmdline leaves the auto default (crypttab/token-binding decides).
 	luksMappings = nil
-	require.NoError(t, parseParams(base))
+	require.NoError(t, parseParamsResolved(base))
 	require.Equal(t, measurePCRAuto, luksMappings[0].measurePCR)
 
 	// Invalid value is rejected (not silently dropped).
 	luksMappings = nil
-	require.Error(t, parseParams(base+" rd.luks.options=tpm2-measure-pcr=bogus"))
+	require.Error(t, parseParamsResolved(base+" rd.luks.options=tpm2-measure-pcr=bogus"))
 }
 
 func TestParseParamsSignature(t *testing.T) {
 	const base = "rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f"
 
 	luksMappings = nil
-	require.NoError(t, parseParams(base+" rd.luks.options=tpm2-signature=/run/sig.json"))
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tpm2-signature=/run/sig.json"))
 	require.Len(t, luksMappings, 1)
 	require.Equal(t, "/run/sig.json", luksMappings[0].tpm2Signature)
 
 	luksMappings = nil
-	require.NoError(t, parseParams(base+" rd.luks.options=tpm2-signature=false"))
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tpm2-signature=false"))
 	require.Equal(t, "false", luksMappings[0].tpm2Signature)
 
 	luksMappings = nil
-	require.NoError(t, parseParams(base))
+	require.NoError(t, parseParamsResolved(base))
 	require.Equal(t, "", luksMappings[0].tpm2Signature)
 }
 
@@ -216,9 +238,26 @@ func TestGetNextParamMulti(t *testing.T) {
 func TestParseParamsLuksHeader(t *testing.T) {
 	luksMappings = nil
 
-	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root rd.luks.header=ab6d7d78-b816-4495-928d-766d6607035e=/etc/luks-headers/root.hdr root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f"))
+	require.NoError(t, parseParamsResolved("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root rd.luks.header=ab6d7d78-b816-4495-928d-766d6607035e=/etc/luks-headers/root.hdr root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f"))
 	require.Len(t, luksMappings, 1)
 	require.Equal(t, "/etc/luks-headers/root.hdr", luksMappings[0].header)
+}
+
+func TestParseParamsLuksHeaderOptionWins(t *testing.T) {
+	const root = "ab6d7d78-b816-4495-928d-766d6607035e"
+	const base = "rd.luks.name=" + root + "=root"
+	const viaHeader = " rd.luks.header=" + root + "=/from-rd-luks-header.hdr"
+	const viaOptions = " rd.luks.options=" + root + "=header=/from-options.hdr"
+
+	// systemd's spelling wins over booster's dedicated parameter, and does so
+	// whatever order the two appear in: the option form is overlaid last.
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+viaHeader+viaOptions))
+	require.Equal(t, "/from-options.hdr", luksMappings[0].header)
+
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+viaOptions+viaHeader))
+	require.Equal(t, "/from-options.hdr", luksMappings[0].header)
 }
 
 func TestParseParamsLuksHeaderInvalid(t *testing.T) {
@@ -238,25 +277,67 @@ func TestParseParamsLuksHeaderInvalid(t *testing.T) {
 func TestParseParamsTokenTimeout(t *testing.T) {
 	// explicit duration suffix
 	luksMappings = nil
-	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=60s"))
+	require.NoError(t, parseParamsResolved("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=60s"))
 	require.Equal(t, 60*time.Second, luksMappings[0].tokenTimeout)
 
 	// bare integer treated as seconds
 	luksMappings = nil
-	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=45"))
+	require.NoError(t, parseParamsResolved("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=45"))
 	require.Equal(t, 45*time.Second, luksMappings[0].tokenTimeout)
 
 	// token-timeout=0 means wait forever
 	luksMappings = nil
-	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=0"))
+	require.NoError(t, parseParamsResolved("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f rd.luks.options=token-timeout=0"))
 	require.Equal(t, time.Duration(0), luksMappings[0].tokenTimeout)
+}
+
+func TestParseParamsPerDeviceLuksOptions(t *testing.T) {
+	const root = "ab6d7d78-b816-4495-928d-766d6607035e"
+	const data = "7843d77f-cdd6-4289-a4de-a708c4aacede"
+	const base = "rd.luks.name=" + root + "=root rd.luks.name=" + data + "=data"
+
+	// scoped to the named device only — the other mapping is untouched
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options="+data+"=discard"))
+	require.Len(t, luksMappings, 2)
+	require.Empty(t, luksMappings[0].options)
+	require.Equal(t, []string{luks.FlagAllowDiscards}, luksMappings[1].options)
+
+	// the full crypttab vocabulary is reachable, not just the handful the
+	// cmdline used to special-case
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options="+root+"=tries=3,key-slot=2,keyfile-timeout=90"))
+	require.Equal(t, 3, luksMappings[0].tries)
+	require.Equal(t, 2, luksMappings[0].keySlot)
+	require.Equal(t, 90*time.Second, luksMappings[0].keyfileTimeout)
+
+	// systemd's documented detached-header example: the option value carries
+	// its own '=' separators
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options="+root+"=header=/luks.hdr:LABEL=hdrdev"))
+	require.Equal(t, "/luks.hdr", luksMappings[0].header)
+	require.Equal(t, &deviceRef{refFsLabel, "hdrdev"}, luksMappings[0].headerDeviceRef)
+
+	// a list with no UUID keeps applying to every mapping
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=discard"))
+	require.Equal(t, []string{luks.FlagAllowDiscards}, luksMappings[0].options)
+	require.Equal(t, []string{luks.FlagAllowDiscards}, luksMappings[1].options)
+
+	// an option value containing '=' is not mistaken for the per-device form
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=token-timeout=10"))
+	require.Equal(t, 10*time.Second, luksMappings[0].tokenTimeout)
+	require.Equal(t, 10*time.Second, luksMappings[1].tokenTimeout)
+
 }
 
 func TestParseParamsTokenTimeoutDefault(t *testing.T) {
 	// default 30s is set at mapping creation, not via cmdline
 	luksMappings = nil
 	require.NoError(t, parseParams("rd.luks.name=ab6d7d78-b816-4495-928d-766d6607035e=root root=UUID=e8e81fc3-8f81-4a3a-ac3d-aab36aa0c45f"))
-	require.Equal(t, 30*time.Second, luksMappings[0].tokenTimeout)
+	require.Equal(t, luksOptionUnset, int(luksMappings[0].tokenTimeout))
+	require.Equal(t, defaultTokenTimeout, effectiveTokenTimeout(luksMappings[0], nil))
 }
 
 func TestParseParamsInvalidTokenTimeout(t *testing.T) {
@@ -296,4 +377,100 @@ func TestMountFlagsRoRw(t *testing.T) {
 	require.NoError(t, parseParams("rw ro"))
 	flags, _ = mountFlags()
 	require.NotZero(t, flags&unix.MS_RDONLY, "rw ro: ro is last, should be read-only")
+}
+
+func TestRepeatedPerDeviceListsAccumulate(t *testing.T) {
+	// The UUID-less form already accumulates across repeats; the per-device form
+	// used to let the last one silently discard the first.
+	const u = "ab6d7d78-b816-4495-928d-766d6607035e"
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved("rd.luks.name="+u+"=root rd.luks.options="+u+"=tries=5 rd.luks.options="+u+"=key-slot=2"))
+	m := luksMappings[0]
+	require.Equal(t, 5, m.tries, "the first list survives the second")
+	require.Equal(t, 2, m.keySlot)
+}
+func TestParseParamsGlobalLuksOptions(t *testing.T) {
+	const root = "ab6d7d78-b816-4495-928d-766d6607035e"
+	const data = "7843d77f-cdd6-4289-a4de-a708c4aacede"
+	const base = "rd.luks.name=" + root + "=root rd.luks.name=" + data + "=data"
+
+	// a list with no UUID now reaches the whole vocabulary, not just dm-crypt flags
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tries=3,nofail"))
+	for _, m := range luksMappings {
+		require.Equal(t, 3, m.tries)
+		require.True(t, m.noFail)
+	}
+
+	// the per-device form is the more specific of the two and wins
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tries=3 rd.luks.options="+root+"=tries=9"))
+	require.Equal(t, 9, luksMappings[0].tries)
+	require.Equal(t, 3, luksMappings[1].tries)
+
+	// order of the two forms on the command line does not matter
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options="+root+"=tries=9 rd.luks.options=tries=3"))
+	require.Equal(t, 9, luksMappings[0].tries)
+	require.Equal(t, 3, luksMappings[1].tries)
+
+	// a global header= cannot describe several volumes, so it is not applied
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=header=/luks.hdr"))
+	for _, m := range luksMappings {
+		require.Empty(t, m.header)
+	}
+
+	// a per-device option wins even when the value it sets is the zero value:
+	// tries=0 means unlimited, which must not read as "unset" and lose to the
+	// global list
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=tries=3 rd.luks.options="+root+"=tries=0"))
+	require.Equal(t, 0, luksMappings[0].tries)
+	require.Equal(t, 3, luksMappings[1].tries)
+
+	// a global list that does not set token-timeout= leaves it unset, and the
+	// resolver still supplies the 30s default
+	luksMappings = nil
+	require.NoError(t, parseParamsResolved(base+" rd.luks.options=discard"))
+	for _, m := range luksMappings {
+		require.Equal(t, luksOptionUnset, int(m.tokenTimeout))
+		require.Equal(t, defaultTokenTimeout, effectiveTokenTimeout(m, nil))
+	}
+}
+
+// No parameter's meaning may depend on what was read before it: conflicts are
+// settled by composing the sources, not by the order they appear on the command
+// line. Resolve the same set in every rotation and require one outcome.
+func TestParameterOrderDoesNotChangeTheOutcome(t *testing.T) {
+	const u = "fc5197e2-df8f-43a6-9cc7-658dead3cfa4"
+	params := []string{
+		"rd.luks.name=" + u + "=root",
+		"rd.luks.key=/default.key",
+		"rd.luks.options=discard,tries=3",
+		"rd.luks.options=" + u + "=key-slot=2",
+		"rd.luks.header=" + u + "=/old.hdr",
+		"rd.luks.data=" + u + "=/dev/sdx",
+	}
+	const crypttab = "root UUID=" + u + " /entry.key luks,tries=9\n"
+
+	var first string
+	for i := range params {
+		rotated := append(append([]string{}, params[i:]...), params[:i]...)
+		luksMappings = nil
+		globalLuksOptions, globalLuksKeyfile = newLuksOptions(), ""
+		require.NoError(t, parseParams(strings.Join(rotated, " ")))
+		ct, err := parseCrypttabReader(strings.NewReader(crypttab))
+		require.NoError(t, err)
+		resolveLuksOptions(ct)
+
+		m := luksMappings[0]
+		got := fmt.Sprintf("keyfile=%q header=%q options=%v keySlot=%d tries=%d",
+			m.keyfile, m.header, m.options, m.keySlot, m.tries)
+		if i == 0 {
+			first = got
+			continue
+		}
+		require.Equal(t, first, got, "starting from %q resolved differently", rotated[0])
+	}
 }

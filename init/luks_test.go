@@ -52,19 +52,29 @@ func TestResolveKeyfileTimeout(t *testing.T) {
 	defer func() { defaultKeyfileDeviceTimeout = origDefault }()
 
 	t.Run("explicit non-zero wins over mount_timeout", func(t *testing.T) {
-		m := &luksMapping{keyfileTimeout: 45 * time.Second, keyfileTimeoutExplicit: true}
+		m := &luksMapping{
+			luksOptions: newLuksOptions(),
+		}
+		m.keyfileTimeout = 45 * time.Second
 		require.Equal(t, 45*time.Second, resolveKeyfileTimeout(m, 60))
 	})
 	t.Run("explicit zero means infinite", func(t *testing.T) {
-		m := &luksMapping{keyfileTimeout: 0, keyfileTimeoutExplicit: true}
+		m := &luksMapping{
+			luksOptions: newLuksOptions(),
+		}
+		m.keyfileTimeout = 0
 		require.Equal(t, time.Duration(0), resolveKeyfileTimeout(m, 60))
 	})
 	t.Run("unset falls to mount_timeout when set", func(t *testing.T) {
-		m := &luksMapping{} // keyfileTimeoutExplicit false, keyfileTimeout 0
+		m := &luksMapping{
+			luksOptions: newLuksOptions(),
+		} // keyfileTimeout is unset
 		require.Equal(t, 60*time.Second, resolveKeyfileTimeout(m, 60))
 	})
 	t.Run("unset with no mount_timeout uses 30s default", func(t *testing.T) {
-		m := &luksMapping{}
+		m := &luksMapping{
+			luksOptions: newLuksOptions(),
+		}
 		require.Equal(t, 30*time.Second, resolveKeyfileTimeout(m, 0))
 	})
 }
@@ -89,11 +99,15 @@ func TestKeyfileAbsentDeviceDoesNotHang(t *testing.T) {
 	require.NoError(t, err)
 
 	mapping := &luksMapping{
-		name:             "root",
-		keyfile:          "/.diskid",
-		keyfileDeviceRef: &deviceRef{refFsUUID, absent},
-		// keyfileTimeoutExplicit false, keyfileTimeout 0 → unset case → default applies
+
+		name: "root",
+
+		// keyfileTimeout unset, so the default applies
+
+		luksOptions: newLuksOptions(),
 	}
+	mapping.keyfile = "/.diskid"
+	mapping.keyfileDeviceRef = &deviceRef{refFsUUID, absent}
 
 	done := make(chan error, 1)
 	go func() {
@@ -176,11 +190,17 @@ func TestMatchLuksMappingRewritesCmdRootOnRegularLoopMatch(t *testing.T) {
 	require.NoError(t, err)
 
 	m := &luksMapping{
-		ref:          &deviceRef{format: refFsUUID, data: uuid},
-		name:         "cryptroot",
-		keySlot:      -1,
-		tokenTimeout: 30 * time.Second,
+
+		ref: &deviceRef{format: refFsUUID, data: uuid},
+
+		name: "cryptroot",
+
+		luksOptions: newLuksOptions(),
 	}
+
+	m.keySlot = -1
+
+	m.tokenTimeout = 30 * time.Second
 	luksMappings = []*luksMapping{m}
 	cmdRoot = &deviceRef{format: refFsUUID, data: uuid}
 
@@ -204,11 +224,17 @@ func TestMatchLuksMappingLeavesCmdRootAloneWhenItDoesNotMatch(t *testing.T) {
 	require.NoError(t, err)
 
 	swap := &luksMapping{
-		ref:          &deviceRef{format: refFsUUID, data: swapUUID},
-		name:         "cryptswap",
-		keySlot:      -1,
-		tokenTimeout: 30 * time.Second,
+
+		ref: &deviceRef{format: refFsUUID, data: swapUUID},
+
+		name: "cryptswap",
+
+		luksOptions: newLuksOptions(),
 	}
+
+	swap.keySlot = -1
+
+	swap.tokenTimeout = 30 * time.Second
 	luksMappings = []*luksMapping{swap}
 
 	rootRef := &deviceRef{format: refFsUUID, data: rootUUID}
@@ -238,8 +264,8 @@ func TestMatchLuksMappingSynthesisFallbackUnchanged(t *testing.T) {
 	got := matchLuksMapping(blk)
 	require.NotNil(t, got)
 	require.Equal(t, "root", got.name)
-	require.Equal(t, -1, got.keySlot)
-	require.Equal(t, 30*time.Second, got.tokenTimeout)
+	require.Equal(t, luksOptionUnset, got.keySlot)
+	require.Equal(t, luksOptionUnset, int(got.tokenTimeout))
 	require.Same(t, rootRef, got.ref, "synthesised mapping must keep the original cmdRoot ref")
 
 	require.Equal(t, refPath, cmdRoot.format)
@@ -257,11 +283,17 @@ func TestMatchLuksMappingPreservesExplicitMapperPath(t *testing.T) {
 	require.NoError(t, err)
 
 	m := &luksMapping{
-		ref:          &deviceRef{format: refFsUUID, data: uuid},
-		name:         "cryptroot",
-		keySlot:      -1,
-		tokenTimeout: 30 * time.Second,
+
+		ref: &deviceRef{format: refFsUUID, data: uuid},
+
+		name: "cryptroot",
+
+		luksOptions: newLuksOptions(),
 	}
+
+	m.keySlot = -1
+
+	m.tokenTimeout = 30 * time.Second
 	luksMappings = []*luksMapping{m}
 
 	mapperRef := &deviceRef{format: refPath, data: "/dev/mapper/cryptroot"}
@@ -520,15 +552,15 @@ type fenceFakeLuksDevice struct {
 func (f *fenceFakeLuksDevice) UnsealVolume(keyslot int, passphrase []byte) (*luks.Volume, error) {
 	return f.unseal(keyslot, passphrase)
 }
-func (f *fenceFakeLuksDevice) Close() error                                              { return nil }
-func (f *fenceFakeLuksDevice) Version() int                                              { return 2 }
-func (f *fenceFakeLuksDevice) Path() string                                              { return "/dev/fake" }
-func (f *fenceFakeLuksDevice) UUID() string                                              { return "" }
-func (f *fenceFakeLuksDevice) Slots() []int                                              { return []int{0} }
-func (f *fenceFakeLuksDevice) Tokens() ([]luks.Token, error)                             { return nil, nil }
-func (f *fenceFakeLuksDevice) FlagsGet() []string                                        { return nil }
-func (f *fenceFakeLuksDevice) FlagsAdd(flags ...string) error                            { return nil }
-func (f *fenceFakeLuksDevice) FlagsClear()                                               {}
+func (f *fenceFakeLuksDevice) Close() error                   { return nil }
+func (f *fenceFakeLuksDevice) Version() int                   { return 2 }
+func (f *fenceFakeLuksDevice) Path() string                   { return "/dev/fake" }
+func (f *fenceFakeLuksDevice) UUID() string                   { return "" }
+func (f *fenceFakeLuksDevice) Slots() []int                   { return []int{0} }
+func (f *fenceFakeLuksDevice) Tokens() ([]luks.Token, error)  { return nil, nil }
+func (f *fenceFakeLuksDevice) FlagsGet() []string             { return nil }
+func (f *fenceFakeLuksDevice) FlagsAdd(flags ...string) error { return nil }
+func (f *fenceFakeLuksDevice) FlagsClear()                    {}
 func (f *fenceFakeLuksDevice) Unlock(keyslot int, passphrase []byte, dmName string) error {
 	return nil
 }
@@ -701,4 +733,30 @@ func TestRecoverSystemdTPM2RejectsPcrlock(t *testing.T) {
 	pcrlockTok := luks.Token{Type: "systemd-tpm2", Payload: []byte(`{"tpm2-blob":"AA==","tpm2_pcrlock":true}`)}
 	_, err = recoverSystemdTPM2Password(context.Background(), pcrlockTok, "cryptroot", "")
 	require.ErrorContains(t, err, "pcrlock")
+}
+
+// The autodiscovered root is created after resolveLuksOptions has already run,
+// so the UUID-less rd.luks.options= list has to be applied at the creation site
+// or it never reaches the device.
+func TestAutodiscoveredRootGetsGlobalOptions(t *testing.T) {
+	withLuksGlobals(t)
+	origGlobal := globalLuksOptions
+	t.Cleanup(func() { globalLuksOptions = origGlobal })
+
+	uuid, err := parseUUID("ab6d7d78-b816-4495-928d-766d6607035e")
+	require.NoError(t, err)
+
+	globalLuksOptions = newLuksOptions()
+	globalLuksOptions.options = []string{luks.FlagAllowDiscards}
+	globalLuksOptions.tries = 5
+	globalLuksOptions.header = "/luks.hdr" // rejected globally; must not reach a device
+
+	luksMappings = nil
+	cmdRoot = &deviceRef{format: refFsUUID, data: uuid}
+
+	m := matchLuksMapping(&blkInfo{path: "/dev/sda2", format: "luks", uuid: uuid})
+	require.NotNil(t, m)
+	require.Equal(t, []string{luks.FlagAllowDiscards}, m.options)
+	require.Equal(t, 5, m.tries)
+	require.Empty(t, m.header, "a global header= must not reach a device")
 }
