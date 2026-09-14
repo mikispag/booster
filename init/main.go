@@ -1252,8 +1252,8 @@ var getZfsPropertyValue = func(property, dataset string) (string, error) {
 }
 
 // execZfsLoadKey runs `zfs load-key <encryptionRoot>` feeding password via stdin if provided.
-// Returns (true, nil) on success, (false, nil) on incorrect passphrase (*exec.ExitError),
-// or (false, err) on systemic execution errors.
+// Returns (false, nil) for an incorrect interactive passphrase or SSH cancellation.
+// Unattended failures preserve the command's error and diagnostic output.
 // Indirected through a var so tests can mock it.
 var execZfsLoadKey = func(ctx context.Context, encryptionRoot string, password []byte) (bool, error) {
 	cmd := exec.CommandContext(ctx, "zfs", "load-key", encryptionRoot)
@@ -1268,13 +1268,16 @@ var execZfsLoadKey = func(ctx context.Context, encryptionRoot string, password [
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return false, nil
+			if password != nil {
+				return false, nil
+			}
+			return false, ctx.Err()
 		}
-		if _, ok := err.(*exec.ExitError); ok {
+		if _, ok := err.(*exec.ExitError); ok && password != nil {
 			debug("zfs load-key for %s failed: %v: %s", encryptionRoot, err, strings.TrimSpace(stderr.String()))
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("zfs load-key %s: %w: %s", encryptionRoot, err, strings.TrimSpace(stderr.String()))
 	}
 	return true, nil
 }
