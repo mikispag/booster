@@ -209,7 +209,9 @@ var keyboardSem = make(chan struct{}, 1)
 // devices themselves.
 var pendingPrompts struct {
 	sync.Mutex
-	entries map[*promptRegistration]struct{}
+	entries      map[*promptRegistration]struct{}
+	zfsDiscovery bool
+	changed      chan struct{}
 }
 
 type promptRegistration struct {
@@ -243,12 +245,14 @@ func registerPendingPrompt(p *promptRegistration) {
 		pendingPrompts.entries = make(map[*promptRegistration]struct{})
 	}
 	pendingPrompts.entries[p] = struct{}{}
+	notifyPendingPromptsLocked()
 }
 
 func unregisterPendingPrompt(p *promptRegistration) {
 	pendingPrompts.Lock()
 	defer pendingPrompts.Unlock()
 	delete(pendingPrompts.entries, p)
+	notifyPendingPromptsLocked()
 }
 
 // trySubmitPassphraseToPending tries password against every currently-pending
@@ -326,7 +330,18 @@ func trySubmitPassphraseToPending(password []byte) []string {
 // the operator can see which devices a submission will be broadcast against,
 // and so the loop can detect "everything unlocked" and disconnect cleanly.
 func pendingDeviceNames() []string {
+	names, _, _ := pendingPromptState()
+	return names
+}
+
+// pendingPromptState snapshots discovery and registrations together so SSH cannot
+// miss a newly registered encryption root while waiting between ZFS datasets.
+func pendingPromptState() ([]string, bool, <-chan struct{}) {
 	pendingPrompts.Lock()
+	defer pendingPrompts.Unlock()
+	if pendingPrompts.changed == nil {
+		pendingPrompts.changed = make(chan struct{})
+	}
 	names := make([]string, 0, len(pendingPrompts.entries))
 	for p := range pendingPrompts.entries {
 		if p.ctx != nil && p.ctx.Err() != nil {
@@ -334,9 +349,23 @@ func pendingDeviceNames() []string {
 		}
 		names = append(names, p.mappingName)
 	}
-	pendingPrompts.Unlock()
 	sort.Strings(names)
-	return names
+	return names, pendingPrompts.zfsDiscovery, pendingPrompts.changed
+}
+
+func setZfsUnlockDiscovery(active bool) {
+	pendingPrompts.Lock()
+	defer pendingPrompts.Unlock()
+	pendingPrompts.zfsDiscovery = active
+	notifyPendingPromptsLocked()
+}
+
+// notifyPendingPromptsLocked requires pendingPrompts to be locked.
+func notifyPendingPromptsLocked() {
+	if pendingPrompts.changed != nil {
+		close(pendingPrompts.changed)
+	}
+	pendingPrompts.changed = make(chan struct{})
 }
 
 // rd luks options match systemd naming https://www.freedesktop.org/software/systemd/man/crypttab.html

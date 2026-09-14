@@ -1118,6 +1118,9 @@ func boost() error {
 		}
 	}
 
+	if config.EnableZfs {
+		setZfsUnlockDiscovery(true)
+	}
 	if config.Network != nil && config.Network.SshAuthorizedKeys != "" {
 		go sshRun(config.Network)
 	}
@@ -1148,6 +1151,8 @@ func boost() error {
 }
 
 func mountZfsRoot() error {
+	defer setZfsUnlockDiscovery(false)
+
 	// note that 'zfs' module already in modulesForceLoad list and it already started loading
 	// this loadModule() is for zfs module synchronization - we need to wait till the full module loading
 	// before we try to import a pool

@@ -212,7 +212,7 @@ func TestSshPromptLoopUnlocksZfsDataset(t *testing.T) {
 	ch := &fakeChannel{in: &input}
 
 	addr := &fakeAddr{}
-	sshPromptLoop(ch, addr)
+	sshPromptLoop(ch, nil, addr)
 
 	got := ch.out.String()
 	require.Contains(t, got, "Enter passphrase for tank/encrypted/root: ")
