@@ -11,6 +11,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMountZfsRootImportTimeout(t *testing.T) {
+	origConfig, origDataset := config, zfsDataset
+	t.Cleanup(func() {
+		config, zfsDataset = origConfig, origDataset
+	})
+	config = InitConfig{BuiltinModules: map[string]bool{"zfs": true}}
+	zfsDataset = "boosterdirty/ROOT"
+	binDir := t.TempDir()
+	t.Setenv("PATH", binDir)
+	require.NoError(t, os.WriteFile(binDir+"/zpool", []byte("#!/bin/sh\necho \"cannot import 'boosterdirty': pool was previously in use from another system\" >&2\nexit 1\n"), 0o755))
+
+	for _, tc := range []struct {
+		name         string
+		mountTimeout int
+		wantTimeout  time.Duration
+	}{
+		{"default", 0, 30 * time.Second},
+		{"configured", 1, time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.MountTimeout = tc.mountTimeout
+			started := time.Now()
+			err := mountZfsRoot()
+			require.ErrorContains(t, err, "zpool import boosterdirty: exit status 1: cannot import 'boosterdirty': pool was previously in use from another system")
+			require.GreaterOrEqual(t, time.Since(started), tc.wantTimeout)
+			require.Less(t, time.Since(started), tc.wantTimeout+5*time.Second)
+		})
+	}
+}
+
 func resetZfsHarness(t *testing.T) {
 	resetKeyboardHarness(t)
 	origExec := execZfsLoadKey
@@ -331,4 +361,3 @@ func TestLoadZfsKeyFileLocationFailure(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "loading key for zroot/ROOT from file:///nonexistent.key failed")
 }
-

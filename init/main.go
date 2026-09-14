@@ -1161,7 +1161,7 @@ func mountZfsRoot() error {
 	debug("importing zfs pool %s", pool)
 
 	var importErr error
-	var deadline time.Time
+	deadline := time.Now().Add(30 * time.Second)
 	if config.MountTimeout > 0 {
 		deadline = time.Now().Add(time.Duration(config.MountTimeout) * time.Second)
 	}
@@ -1178,7 +1178,7 @@ func mountZfsRoot() error {
 		} else {
 			importErr = fmt.Errorf("zpool import %s: %w: %s", pool, errNoCache, strings.TrimSpace(stderrNoCache.String()))
 		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
+		if time.Now().After(deadline) {
 			return importErr
 		}
 		time.Sleep(250 * time.Millisecond)
