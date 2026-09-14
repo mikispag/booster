@@ -1170,23 +1170,26 @@ func mountZfsRoot() error {
 	if config.MountTimeout > 0 {
 		deadline = time.Now().Add(time.Duration(config.MountTimeout) * time.Second)
 	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 	for {
-		cmd := exec.Command("zpool", "import", "-c", "/etc/zfs/zpool.cache", "-N", pool)
+		cmd := exec.CommandContext(ctx, "zpool", "import", "-c", "/etc/zfs/zpool.cache", "-N", pool)
 		if err := cmd.Run(); err == nil {
 			break
 		}
-		cmdNoCache := exec.Command("zpool", "import", "-N", pool)
+		cmdNoCache := exec.CommandContext(ctx, "zpool", "import", "-N", pool)
 		var stderrNoCache bytes.Buffer
 		cmdNoCache.Stderr = &stderrNoCache
 		if errNoCache := cmdNoCache.Run(); errNoCache == nil {
 			break
-		} else {
+		} else if ctx.Err() == nil || importErr == nil {
 			importErr = fmt.Errorf("zpool import %s: %w: %s", pool, errNoCache, strings.TrimSpace(stderrNoCache.String()))
 		}
-		if time.Now().After(deadline) {
-			return importErr
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %w", ctx.Err(), importErr)
+		case <-time.After(250 * time.Millisecond):
 		}
-		time.Sleep(250 * time.Millisecond)
 	}
 
 	// find all child datasets and mount them
