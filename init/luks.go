@@ -193,13 +193,14 @@ var passphraseCache struct {
 	passwords [][]byte
 }
 
-// keyboardMu serializes keyboard password prompts across concurrent luksOpen calls.
+// keyboardSem serializes keyboard password prompts across concurrent unlocks.
 // Without this, two devices unlocked simultaneously (e.g. root + swap LUKS, or
 // btrfs RAID1 members) both check passphraseCache before either has stored a
-// successful password, causing a double prompt. Holding the mutex ensures the
+// successful password, causing a double prompt. Holding the semaphore ensures the
 // second device re-checks the cache after the first has finished prompting and
 // stored its passphrase.
-var keyboardMu sync.Mutex
+// Waiting for the semaphore is cancellable by remote unlock.
+var keyboardSem = make(chan struct{}, 1)
 
 // pendingPrompts holds the set of keyboard prompts currently awaiting a
 // passphrase. Out-of-band password sources (SSH remote unlock) submit through
@@ -1590,8 +1591,12 @@ func requestKeyboardPassword(ctx context.Context, volumes chan *luks.Volume, d l
 	// keyboard goroutine starts while the first device is prompting will block
 	// here, then re-check the cache after the first device succeeds and releases
 	// the lock — avoiding a double prompt for shared passphrases (issue #306).
-	keyboardMu.Lock()
-	defer keyboardMu.Unlock()
+	select {
+	case keyboardSem <- struct{}{}:
+		defer func() { <-keyboardSem }()
+	case <-ctx.Done():
+		return
+	}
 
 	// Re-check after acquiring the lock: another device may have just unlocked.
 	select {
