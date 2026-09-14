@@ -324,7 +324,8 @@ func TestLoadZfsKeyFileLocationWaitsForFile(t *testing.T) {
 	}
 
 	execZfsLoadKey = func(ctx context.Context, encryptionRoot string, password []byte) (bool, error) {
-		return true, nil
+		_, err := os.Stat(keyfile)
+		return err == nil, nil
 	}
 
 	// Create file after short delay

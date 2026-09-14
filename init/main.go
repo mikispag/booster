@@ -1311,32 +1311,34 @@ func loadZfsKey(encryptionRoot string) error {
 	}
 
 	if location != "prompt" {
-		if strings.HasPrefix(location, "file://") {
-			path := strings.TrimPrefix(location, "file://")
-			timeout := defaultKeyfileDeviceTimeout
-			if config.MountTimeout > 0 {
-				timeout = time.Duration(config.MountTimeout) * time.Second
+		timeout := defaultKeyfileDeviceTimeout
+		if config.MountTimeout > 0 {
+			timeout = time.Duration(config.MountTimeout) * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		var loadErr error
+		for ctx.Err() == nil {
+			ok, err := execZfsLoadKey(ctx, encryptionRoot, nil)
+			if ok {
+				return nil
 			}
-			for deadline := time.Now().Add(timeout); ; {
-				if _, err := os.Stat(path); err == nil {
+			if err != nil {
+				if ctx.Err() != nil {
 					break
 				}
-				if time.Now().After(deadline) {
-					warning("zfs: key file %s has not appeared, trying anyway", path)
-					break
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					return fmt.Errorf("loading key for %s from %s failed: %w", encryptionRoot, location, err)
 				}
-				time.Sleep(100 * time.Millisecond)
+				loadErr = err
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
 			}
 		}
-
-		ok, err := execZfsLoadKey(context.Background(), encryptionRoot, nil)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("loading key for %s from %s failed", encryptionRoot, location)
-		}
-		return nil
+		return fmt.Errorf("loading key for %s from %s failed: %w", encryptionRoot, location, errors.Join(ctx.Err(), loadErr))
 	}
 
 	// Fast path: try cached passwords from previously unlocked volumes/datasets
