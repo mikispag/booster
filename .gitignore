@@ -1,6 +1,5 @@
 # IDE config files
 .idea
-tasks/
 
 # Build artifacts
 init/init
