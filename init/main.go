@@ -1436,6 +1436,9 @@ func loadZfsKey(encryptionRoot string) error {
 		}
 
 		wipe(password)
+		if ctx.Err() != nil {
+			return nil
+		}
 		promptPrefix = "Incorrect passphrase — "
 		if !plymouthEnabled {
 			console("   Incorrect passphrase, please try again\n")
