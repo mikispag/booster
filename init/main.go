@@ -1165,29 +1165,42 @@ func mountZfsRoot() error {
 
 	debug("importing zfs pool %s", pool)
 
-	var importErr error
-	deadline := time.Now().Add(30 * time.Second)
+	timeout := 30 * time.Second
 	if config.MountTimeout > 0 {
-		deadline = time.Now().Add(time.Duration(config.MountTimeout) * time.Second)
+		timeout = time.Duration(config.MountTimeout) * time.Second
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	importArgs := [][]string{
+		{"import", "-c", "/etc/zfs/zpool.cache", "-N", pool},
+		{"import", "-N", pool},
+	}
+	var importErrors [2]error
+importLoop:
 	for {
-		cmd := exec.CommandContext(ctx, "zpool", "import", "-c", "/etc/zfs/zpool.cache", "-N", pool)
-		if err := cmd.Run(); err == nil {
-			break
-		}
-		cmdNoCache := exec.CommandContext(ctx, "zpool", "import", "-N", pool)
-		var stderrNoCache bytes.Buffer
-		cmdNoCache.Stderr = &stderrNoCache
-		if errNoCache := cmdNoCache.Run(); errNoCache == nil {
-			break
-		} else if ctx.Err() == nil || importErr == nil {
-			importErr = fmt.Errorf("zpool import %s: %w: %s", pool, errNoCache, strings.TrimSpace(stderrNoCache.String()))
+		for i, args := range importArgs {
+			cmd := exec.CommandContext(ctx, "zpool", args...)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			if err == nil {
+				break importLoop
+			}
+			if diagnostic := strings.TrimSpace(stderr.String()); diagnostic != "" {
+				importErrors[i] = fmt.Errorf("zpool import %s: %w: %s", pool, err, diagnostic)
+			} else if importErrors[i] == nil && ctx.Err() == nil {
+				importErrors[i] = fmt.Errorf("zpool import %s: %w", pool, err)
+			}
+			if ctx.Err() != nil {
+				break
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %w", ctx.Err(), importErr)
+			return errors.Join(
+				fmt.Errorf("zpool import %s timed out after %s before completion; increase mount_timeout if device discovery needs more time: %w", pool, timeout, ctx.Err()),
+				importErrors[0], importErrors[1],
+			)
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
