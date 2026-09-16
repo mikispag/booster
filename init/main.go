@@ -1386,12 +1386,11 @@ func loadZfsKey(encryptionRoot string) error {
 	default:
 	}
 
-	select {
-	case keyboardSem <- struct{}{}:
-		defer func() { <-keyboardSem }()
-	case <-ctx.Done():
+	release, ok := acquireKeyboard(ctx)
+	if !ok {
 		return nil
 	}
+	defer release()
 
 	select {
 	case <-ctx.Done():

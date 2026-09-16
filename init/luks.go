@@ -202,6 +202,17 @@ var passphraseCache struct {
 // Waiting for the semaphore is cancellable by remote unlock.
 var keyboardSem = make(chan struct{}, 1)
 
+// acquireKeyboard returns an idempotent release function, including when canceled.
+func acquireKeyboard(ctx context.Context) (release func(), ok bool) {
+	select {
+	case keyboardSem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-keyboardSem }) }, true
+	case <-ctx.Done():
+		return func() {}, false
+	}
+}
+
 // pendingPrompts holds the set of keyboard prompts currently awaiting a
 // passphrase. Out-of-band password sources (SSH remote unlock) submit through
 // this registry so they share the unlock orchestration (ctx cancellation,
@@ -1620,12 +1631,11 @@ func requestKeyboardPassword(ctx context.Context, volumes chan *luks.Volume, d l
 	// keyboard goroutine starts while the first device is prompting will block
 	// here, then re-check the cache after the first device succeeds and releases
 	// the lock — avoiding a double prompt for shared passphrases (issue #306).
-	select {
-	case keyboardSem <- struct{}{}:
-		defer func() { <-keyboardSem }()
-	case <-ctx.Done():
+	release, ok := acquireKeyboard(ctx)
+	if !ok {
 		return
 	}
+	defer release()
 
 	// Re-check after acquiring the lock: another device may have just unlocked.
 	select {
