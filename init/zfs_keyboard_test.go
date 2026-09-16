@@ -17,7 +17,10 @@ func TestLoadZfsKeySshUnlockWhileKeyboardBusy(t *testing.T) {
 	held := true
 	t.Cleanup(func() {
 		if held {
-			<-keyboardSem
+			select {
+			case <-keyboardSem:
+			default:
+			}
 		}
 	})
 	asked := make(chan struct{}, 1)
